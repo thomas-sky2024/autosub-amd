@@ -35,7 +35,14 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install
-      
+
+      - name: Pre-download sherpa-onnx libs
+        run: |
+          mkdir -p /tmp/sherpa-onnx-cache
+          curl -L --retry 5 --retry-delay 10 \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.34/sherpa-onnx-v1.12.34-osx-x64-static-lib.tar.bz2" \
+            -o /tmp/sherpa-onnx-cache/sherpa-onnx-v1.12.34-osx-x64-static-lib.tar.bz2
+
       - name: Setup Sidecar Binaries
         run: |
           # Đảm bảo thư mục tồn tại
@@ -53,6 +60,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHERPA_ONNX_ARCHIVE_DIR: /tmp/sherpa-onnx-cache
         with:
           tagName: v__VERSION__ # tauri-action will replace this with the version from tauri.conf.json
           releaseName: "AutoSub v__VERSION__"

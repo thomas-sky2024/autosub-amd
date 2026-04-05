@@ -68,7 +68,9 @@ pub async fn download_media(app: AppHandle, opts: DownloadOptions) -> Result<Dow
         "mp4" => {
             args.extend([
                 "-f",
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "bestvideo+bestaudio/best",
+                "--merge-output-format",
+                "mp4",
             ]);
         }
         _ => {
