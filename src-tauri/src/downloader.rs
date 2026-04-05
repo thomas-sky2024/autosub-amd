@@ -11,6 +11,7 @@ pub struct DownloadOptions {
     pub format: String, // "mp4", "mp3", or "wav"
     pub save_local: bool,
     pub output_dir: Option<PathBuf>,
+    pub browser: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -51,7 +52,14 @@ pub async fn download_media(app: AppHandle, opts: DownloadOptions) -> Result<Dow
         "--progress",
         "--output",
         "%(title)s.%(ext)s",
+        "--sleep-interval", "5",
     ];
+
+    if let Some(ref browser) = opts.browser {
+        if !browser.is_empty() {
+             args.extend(["--cookies-from-browser", browser]);
+        }
+    }
 
     match opts.format.as_str() {
         "mp3" => {
@@ -85,8 +93,7 @@ pub async fn download_media(app: AppHandle, opts: DownloadOptions) -> Result<Dow
         r"\[download\]\s+([\d.]+)\%\s+of\s+[\d.]+\w+\s+at\s+([\d.]+\w+/s)\s+ETA\s+([\d:]+)",
     )
     .unwrap();
-    let re_dest =
-        Regex::new(r"\[(?:destination|ffmpeg|ExtractAudio)\]\s+(?:Destination:\s+)?(.+)").unwrap();
+
 
     while let Some(event) = rx.recv().await {
         if let tauri_plugin_shell::process::CommandEvent::Stdout(line) = event {
@@ -115,12 +122,10 @@ pub async fn download_media(app: AppHandle, opts: DownloadOptions) -> Result<Dow
                     },
                 )
                 .ok();
-            } else if let Some(caps) = re_dest.captures(&line_str) {
-                let path_str = caps
-                    .get(1)
-                    .map(|m| m.as_str().trim().trim_matches('"'))
-                    .unwrap_or("");
-                if !path_str.is_empty() && !path_str.contains("Merging formats") {
+            } else if line_str.contains("Destination:") {
+                let parts: Vec<&str> = line_str.splitn(2, "Destination:").collect();
+                if parts.len() == 2 {
+                    let path_str = parts[1].trim().trim_matches('"');
                     let path = PathBuf::from(path_str);
                     final_path = Some(output_dir.join(&path));
                     title = path
@@ -128,10 +133,22 @@ pub async fn download_media(app: AppHandle, opts: DownloadOptions) -> Result<Dow
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path_str.to_string());
                 }
+            } else if line_str.contains("has already been downloaded") {
+                if let Some(start) = line_str.find(']') {
+                    if let Some(end) = line_str.find("has already been downloaded") {
+                        let path_str = line_str[start + 1..end].trim().trim_matches('"');
+                        let path = PathBuf::from(path_str);
+                        final_path = Some(output_dir.join(&path));
+                        title = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path_str.to_string());
+                    }
+                }
             } else if line_str.contains("Merging formats into") {
-                if let Some(start) = line_str.find('"') {
-                    if let Some(end) = line_str.rfind('"') {
-                        let path_str = &line_str[start + 1..end];
+                if let Some(start) = line_str.find("into \"") {
+                    if let Some(end) = line_str[start + 6..].find('"') {
+                        let path_str = &line_str[start + 6..start + 6 + end];
                         let path = PathBuf::from(path_str);
                         final_path = Some(output_dir.join(&path));
                         title = path

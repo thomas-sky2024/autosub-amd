@@ -29,6 +29,7 @@ pub struct JobHandle {
 pub struct JobManager {
     state: Arc<Mutex<JobState>>,
     handle: Arc<Mutex<Option<JobHandle>>>,
+    pub active_task: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl JobManager {
@@ -36,6 +37,7 @@ impl JobManager {
         Self {
             state: Arc::new(Mutex::new(JobState::Idle)),
             handle: Arc::new(Mutex::new(None)),
+            active_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -110,6 +112,12 @@ impl JobManager {
             }
             // Signal the pipeline
             let _ = h.cancel_tx.send(());
+        }
+
+        // Abort the tokio task if it exists
+        if let Some(task) = self.active_task.lock().unwrap().take() {
+            task.abort();
+            info!("job_manager: aborted active tokio task");
         }
 
         let mut state = self.state.lock().unwrap();

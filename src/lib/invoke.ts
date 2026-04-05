@@ -33,6 +33,7 @@ export interface DownloadOptions {
   format: string; // "mp4", "mp3", or "wav"
   save_local: boolean;
   output_dir?: string;
+  browser?: string;
 }
 
 export interface DownloadResult {

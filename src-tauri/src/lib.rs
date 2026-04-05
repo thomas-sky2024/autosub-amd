@@ -44,7 +44,33 @@ async fn start_pipeline(
 ) -> Result<PipelineResult, error::AutoSubError> {
     let jm = state.inner.job_manager.clone();
     jm.reset();
-    pipeline_v2::run(app, opts, jm, state.inner.clone()).await
+    
+    let app_handle = app.clone();
+    let state_inner = state.inner.clone();
+    let jm_task = jm.clone();
+    
+    let task = tokio::spawn(async move {
+        pipeline_v2::run(app_handle, opts, jm_task, state_inner).await
+    });
+    
+    {
+        let mut active = jm.active_task.lock().unwrap();
+        *active = Some(task.abort_handle());
+    }
+    
+    let result = task.await;
+    
+    // Clear the task handle
+    {
+        let mut active = jm.active_task.lock().unwrap();
+        *active = None;
+    }
+    
+    match result {
+        Ok(res) => res,
+        Err(e) if e.is_cancelled() => Err(error::AutoSubError::Cancelled),
+        Err(e) => Err(error::AutoSubError::WhisperDecode(format!("Task error: {}", e))),
+    }
 }
 
 #[tauri::command]
@@ -170,21 +196,25 @@ pub fn run() {
         // chưa được deallocate → crash log khi tắt app (Cmd+Q hoặc nút đóng).
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                log::info!("lib: window destroyed, setting exit flag");
                 let state = window.state::<AppState>();
-                // Block để đảm bảo drop xảy ra trước khi Metal cleanup.
-                // Nếu không, ggml_metal_rsets_free() assert fail vì Metal
-                // residency sets chưa được deallocate → crash log khi tắt app.
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = rt {
-                    handle.block_on(async {
-                        let mut engine = state.inner.whisper_engine.lock().await;
-                        *engine = None;
-                        let mut loaded: tokio::sync::MutexGuard<String> =
-                            state.inner.loaded_model.lock().await;
-                        loaded.clear();
-                    });
+                state.inner.exit_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                
+                // Abort bất kỳ task nào đang chạy
+                state.inner.job_manager.cancel();
+
+                log::info!("lib: dropping whisper engine manually");
+                if let Ok(mut engine) = state.inner.whisper_engine.try_lock() {
+                    *engine = None;
+                } else {
+                    log::warn!("lib: whisper engine is locked (task running), forcing drop to prevent ggml abort");
+                    // Forcefully drop it using blocking_lock since we are shutting down
+                    let mut engine = state.inner.whisper_engine.blocking_lock();
+                    *engine = None;
                 }
-                log::info!("lib: whisper engine dropped on window destroy");
+                
+                let mut loaded = state.inner.loaded_model.blocking_lock();
+                loaded.clear();
             }
         })
         .run(tauri::generate_context!())

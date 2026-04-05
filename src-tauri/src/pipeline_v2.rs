@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,7 @@ pub struct AppStateV2 {
     pub job_manager: Arc<JobManager>,
     pub whisper_engine: Arc<Mutex<Option<WhisperEngine>>>,
     pub loaded_model: Arc<Mutex<String>>,
+    pub exit_flag: Arc<AtomicBool>,
 }
 
 impl AppStateV2 {
@@ -66,6 +68,7 @@ impl AppStateV2 {
             job_manager: Arc::new(JobManager::new()),
             whisper_engine: Arc::new(Mutex::new(None)),
             loaded_model: Arc::new(Mutex::new(String::new())),
+            exit_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -361,6 +364,12 @@ pub async fn run(
     let mut all_segs: Vec<subtitle::Segment> = Vec::new();
 
     for (idx, batch) in batches.into_iter().enumerate() {
+        // Kiểm tra dừng hoặc thoát app
+        if state.exit_flag.load(Ordering::SeqCst) || job_mgr.state() == crate::job_manager::JobState::Cancelled {
+            info!("pipeline_v2: cancellation or exit detected, stopping batch loop");
+            break;
+        }
+
         let pstart = 35.0 + (idx as f32 / total as f32) * 45.0;
         let pend   = 35.0 + ((idx + 1) as f32 / total as f32) * 45.0;
 

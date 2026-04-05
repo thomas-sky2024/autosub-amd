@@ -23,6 +23,7 @@
   let url = $state("");
   let downloadFormat = $state<"wav" | "mp3" | "mp4">("wav");
   let saveLocal = $state(false);
+  let selectedBrowser = $state<string>("chrome"); // Default to Chrome
   
   let unlisten: (() => void) | null = null;
   let unlistenDownload: (() => void) | null = null;
@@ -152,6 +153,7 @@
           url,
           format: downloadFormat,
           save_local: saveLocal,
+          browser: selectedBrowser,
         });
         currentPath = dlResult.file_path;
         videoName = dlResult.title;
@@ -434,11 +436,23 @@
                   <option value="mp4">Transcribe & Save MP4</option>
                 </select>
               </div>
-              <div class="option-item checkbox-item">
+               <div class="option-item checkbox-item">
                 <label class="checkbox-label">
                   <input type="checkbox" bind:checked={saveLocal} />
                   <span>Save local copy to Downloads</span>
                 </label>
+              </div>
+
+              <div class="option-item">
+                <label class="field-label" for="browser-select">Cookies from Browser</label>
+                <select id="browser-select" class="select" bind:value={selectedBrowser}>
+                  <option value="">None (Public IP)</option>
+                  <option value="chrome">Chrome</option>
+                  <option value="safari">Safari</option>
+                  <option value="edge">Edge</option>
+                  <option value="firefox">Firefox</option>
+                </select>
+                <p class="field-sub">Dùng cookies giúp tránh lỗi "Too Many Requests" (429).</p>
               </div>
             </div>
           </div>
