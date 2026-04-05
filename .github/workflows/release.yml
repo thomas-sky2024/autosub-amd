@@ -37,21 +37,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install
       
-      - name: Prepare Sidecars (x86_64)
+      - name: Setup Sidecar Binaries
         run: |
+          # Đảm bảo thư mục tồn tại
           mkdir -p src-tauri/binaries
           
-          echo "Copying sidecar binaries from repository..."
+          # Chuyển đến thư mục chứa binaries
+          cd src-tauri/binaries
           
-          # Copy các binary đã upload sẵn trong repo
-          cp src-tauri/binaries/ffmpeg-x86_64-apple-darwin     src-tauri/binaries/ffmpeg-x86_64-apple-darwin     || echo "FFmpeg not found"
-          cp src-tauri/binaries/yt-dlp-x86_64-apple-darwin     src-tauri/binaries/yt-dlp-x86_64-apple-darwin     || echo "yt-dlp not found"
-          cp src-tauri/binaries/demucs-main-x86_64-apple-darwin src-tauri/binaries/demucs-main-x86_64-apple-darwin || echo "Demucs not found"
-          
-          # Đảm bảo quyền thực thi
-          chmod +x src-tauri/binaries/*
-          
-          ls -la src-tauri/binaries/
+          # Cấp quyền thực thi (executable) cho các file đã có sẵn
+          chmod +x ffmpeg-x86_64-apple-darwin || true
+          chmod +x ffprobe-x86_64-apple-darwin || true
+          chmod +x yt-dlp-x86_64-apple-darwin || true
 
       - name: Build for Mac Intel (x86_64)
         uses: tauri-apps/tauri-action@v0
