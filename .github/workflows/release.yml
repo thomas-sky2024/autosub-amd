@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install dependencies
+        run: pnpm install
+      
+      - name: Prepare Sidecars (x86_64)
+        run: |
+          mkdir -p src-tauri/binaries
+          
+          echo "Copying sidecar binaries from repository..."
+          
+          # Copy các binary đã upload sẵn trong repo
+          cp src-tauri/binaries/ffmpeg-x86_64-apple-darwin     src-tauri/binaries/ffmpeg-x86_64-apple-darwin     || echo "FFmpeg not found"
+          cp src-tauri/binaries/yt-dlp-x86_64-apple-darwin     src-tauri/binaries/yt-dlp-x86_64-apple-darwin     || echo "yt-dlp not found"
+          cp src-tauri/binaries/demucs-main-x86_64-apple-darwin src-tauri/binaries/demucs-main-x86_64-apple-darwin || echo "Demucs not found"
+          
+          # Đảm bảo quyền thực thi
+          chmod +x src-tauri/binaries/*
+          
+          ls -la src-tauri/binaries/
+
+      - name: Build for Mac Intel (x86_64)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__ # tauri-action will replace this with the version from tauri.conf.json
+          releaseName: "AutoSub v__VERSION__"
+          releaseBody: "Bản phát hành AutoSub cho Mac Intel. Vui lòng đọc kỹ hướng dẫn cài đặt trong README.md để vượt Gatekeeper."
+          releaseDraft: true
+          prerelease: false
+          args: --target x86_64-apple-darwin

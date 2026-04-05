@@ -1,0 +1,192 @@
+//! lib.rs v2 — tích hợp VAD native + Whisper native.
+//!
+//! Thay đổi so với v1:
+//! - AppState → AppStateV2 (thêm whisper_engine: Arc<Mutex<Option<WhisperEngine>>>)
+//! - pipeline::run → pipeline_v2::run
+//! - Thêm module vad và whisper_native
+//! - Frontend commands giữ nguyên 100% — không cần đổi TypeScript
+
+mod cache;
+mod demucs;
+mod downloader;
+mod error;
+mod ffmpeg;
+mod job_manager;
+mod model_manager;
+mod pipeline_v2;      // THAY pipeline → pipeline_v2
+mod post_process;
+mod subtitle;
+mod subtitle_sync;
+mod thermal;
+mod utils;
+mod validator;
+mod vad;              // MỚI: native VAD module
+mod whisper_native;   // MỚI: native Whisper module
+
+// Unused JobManager import removed
+use pipeline_v2::{AppStateV2, PipelineOptions, PipelineResult};
+use std::sync::Arc;
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_shell::ShellExt;
+
+/// Shared app state v2 — thread-safe, giữ Whisper model trong RAM.
+pub struct AppState {
+    pub inner: Arc<AppStateV2>,
+}
+
+// ── Tauri Commands (giữ nguyên signature — frontend tương thích) ──────────────
+
+#[tauri::command]
+async fn start_pipeline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    opts: PipelineOptions,
+) -> Result<PipelineResult, error::AutoSubError> {
+    let jm = state.inner.job_manager.clone();
+    jm.reset();
+    pipeline_v2::run(app, opts, jm, state.inner.clone()).await
+}
+
+#[tauri::command]
+async fn cancel_job(state: State<'_, AppState>) -> Result<(), error::AutoSubError> {
+    state.inner.job_manager.cancel();
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_job_state(
+    state: State<'_, AppState>,
+) -> Result<job_manager::JobState, error::AutoSubError> {
+    Ok(state.inner.job_manager.state())
+}
+
+#[tauri::command]
+async fn check_model(model_name: String) -> Result<bool, error::AutoSubError> {
+    Ok(model_manager::ModelManager::verify_model(&model_name))
+}
+
+#[tauri::command]
+async fn list_models() -> Result<Vec<String>, error::AutoSubError> {
+    Ok(model_manager::ModelManager::list_models())
+}
+
+#[derive(serde::Serialize)]
+pub struct EnvironmentAudit {
+    pub ffmpeg: bool,
+    pub whisper: bool,   // true nếu whisper-rs model loaded, hoặc sidecar exists
+    pub ytdlp: bool,
+    pub models_dir: String,
+    pub vad_ready: bool, // MỚI: trạng thái VAD model
+}
+
+#[tauri::command]
+async fn audit_environment(
+    app: AppHandle,
+    _state: State<'_, AppState>,
+) -> Result<EnvironmentAudit, error::AutoSubError> {
+    let ffmpeg_ok = app.shell().sidecar("ffmpeg").is_ok();
+    let ytdlp_ok = app.shell().sidecar("yt-dlp").is_ok();
+    let vad_ready = model_manager::ModelManager::vad_model_ready();
+
+    // Whisper: kiểm tra có model nào không (native engine)
+    let whisper_ok = !model_manager::ModelManager::list_models().is_empty();
+
+    Ok(EnvironmentAudit {
+        ffmpeg: ffmpeg_ok,
+        whisper: whisper_ok,
+        ytdlp: ytdlp_ok,
+        models_dir: model_manager::ModelManager::get_models_dir(),
+        vad_ready,
+    })
+}
+
+/// Unload whisper model khỏi RAM (dùng khi user muốn giải phóng memory).
+#[tauri::command]
+async fn unload_model(state: State<'_, AppState>) -> Result<(), error::AutoSubError> {
+    let mut engine = state.inner.whisper_engine.lock().await;
+    *engine = None;
+    let mut loaded = state.inner.loaded_model.lock().await;
+    loaded.clear();
+    log::info!("lib: whisper model unloaded from RAM");
+    Ok(())
+}
+
+#[tauri::command]
+async fn apply_subtitle_sync(
+    segments: Vec<subtitle::Segment>,
+    start_idx: usize,
+    shift_start_sec: f32,
+    end_idx: usize,
+    shift_end_sec: f32,
+) -> Result<Vec<subtitle::Segment>, error::AutoSubError> {
+    subtitle_sync::apply_point_sync(segments, start_idx, shift_start_sec, end_idx, shift_end_sec)
+}
+
+#[tauri::command]
+async fn export_file(path: String, content: String) -> Result<(), error::AutoSubError> {
+    tokio::fs::write(&path, content).await.map_err(|e| {
+        error::AutoSubError::Export(format!("Failed to write file: {}", e))
+    })
+}
+
+#[tauri::command]
+async fn clear_cache() -> Result<(), error::AutoSubError> {
+    cache::clear_all_cache()
+}
+
+// ── App Entry Point ───────────────────────────────────────────────────────────
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    env_logger::init();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(AppState {
+            inner: Arc::new(AppStateV2::new()),
+        })
+        .invoke_handler(tauri::generate_handler![
+            start_pipeline,
+            cancel_job,
+            get_job_state,
+            check_model,
+            list_models,
+            audit_environment,
+            unload_model,
+            export_file,
+            apply_subtitle_sync,
+            clear_cache,
+            downloader::download_media,
+            model_manager::get_models_status,
+            model_manager::download_model_by_id,
+            model_manager::download_vad_model,
+            model_manager::open_models_dir,
+        ])
+        // Drop WhisperContext (Metal GPU resources) trước khi process exit.
+        // Nếu không, ggml_metal_rsets_free() assert fail vì residency sets
+        // chưa được deallocate → crash log khi tắt app (Cmd+Q hoặc nút đóng).
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                let state = window.state::<AppState>();
+                // Block để đảm bảo drop xảy ra trước khi Metal cleanup.
+                // Nếu không, ggml_metal_rsets_free() assert fail vì Metal
+                // residency sets chưa được deallocate → crash log khi tắt app.
+                let rt = tokio::runtime::Handle::try_current();
+                if let Ok(handle) = rt {
+                    handle.block_on(async {
+                        let mut engine = state.inner.whisper_engine.lock().await;
+                        *engine = None;
+                        let mut loaded: tokio::sync::MutexGuard<String> =
+                            state.inner.loaded_model.lock().await;
+                        loaded.clear();
+                    });
+                }
+                log::info!("lib: whisper engine dropped on window destroy");
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running AutoSub v2");
+}
