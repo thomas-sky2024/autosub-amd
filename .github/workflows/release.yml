@@ -1,8 +1,8 @@
 name: Release
 on:
   push:
-    branches:
-      - main # hoặc master
+    tags:
+      - 'v*' # Workflow sẽ chỉ chạy khi bạn push một tag bắt đầu bằng chữ 'v' (ví dụ: v1.0.0)
 
 jobs:
   release:
