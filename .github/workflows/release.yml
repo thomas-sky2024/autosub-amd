@@ -1,9 +1,8 @@
 name: Release
-
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main # hoặc master
 
 jobs:
   release:
@@ -12,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest]
+        platform: [macos-13]
     runs-on: ${{ matrix.platform }}
 
     steps:
