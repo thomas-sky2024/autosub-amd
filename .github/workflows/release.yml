@@ -62,9 +62,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHERPA_ONNX_ARCHIVE_DIR: /tmp/sherpa-onnx-cache
         with:
-          tagName: v__VERSION__ # tauri-action will replace this with the version from tauri.conf.json
-          releaseName: "AutoSub v__VERSION__"
+          # Đã sửa: Sử dụng chính xác tên tag vừa push (vd: v1.0.1) thay vì phụ thuộc tauri.conf.json
+          tagName: ${{ github.ref_name }} 
+          releaseName: "AutoSub ${{ github.ref_name }}"
           releaseBody: "Bản phát hành AutoSub cho Mac Intel. Vui lòng đọc kỹ hướng dẫn cài đặt trong README.md để vượt Gatekeeper."
-          releaseDraft: true
+          # Đặt false nếu bạn muốn nó publish luôn thành public release, để true nó sẽ nằm ở mục Draft
+          releaseDraft: true 
           prerelease: false
           args: --target x86_64-apple-darwin
