@@ -1,6 +1,6 @@
 {
   "name": "auto-sub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Native macOS subtitle generator powered by whisper.cpp",
   "type": "module",
   "scripts": {

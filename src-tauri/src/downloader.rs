@@ -67,8 +67,8 @@ pub async fn download_media(app: AppHandle, opts: DownloadOptions) -> Result<Dow
         }
         "mp4" => {
             args.extend([
-                "-f",
-                "bestvideo+bestaudio/best",
+                "-S",
+                "ext:mp4:m4a",
                 "--merge-output-format",
                 "mp4",
             ]);
@@ -162,9 +162,7 @@ pub async fn download_media(app: AppHandle, opts: DownloadOptions) -> Result<Dow
             }
         } else if let tauri_plugin_shell::process::CommandEvent::Stderr(line) = event {
             let line_str = String::from_utf8_lossy(&line);
-            if line_str.to_lowercase().contains("error") {
-                return Err(AutoSubError::Download(line_str.to_string()));
-            }
+            log::warn!("yt-dlp stderr: {}", line_str.trim());
         } else if let tauri_plugin_shell::process::CommandEvent::Terminated(payload) = event {
             if payload.code != Some(0) {
                 return Err(AutoSubError::Download(format!(

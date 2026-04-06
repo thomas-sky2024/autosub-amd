@@ -5,33 +5,31 @@
   import pkg from "diff-match-patch";
   const { diff_match_patch: DiffMatchPatch, DIFF_DELETE, DIFF_INSERT, DIFF_EQUAL } = pkg;
   import { jobStore, generateSRTContent } from "$lib/jobStore";
-  import { onMount, onDestroy } from "svelte";
+  import { onMount } from "svelte";
 
   // ── State ─────────────────────────────────────────────────────────────
-  let textOriginal = $state(""); // Bản gốc (Text thuần)
-  let textAI = $state("");       // Bản AI (Nội dung file SRT)
-  let textResult = $state("");   // Kết quả SRT sau khi đồng bộ
-  
-  type Token = { type: number; text: string; };
+  let textOriginal = $state("");
+  let textAI = $state("");
+  let textResult = $state("");
+
+  type Token = { type: number; text: string };
   let diffTokens = $state<Token[]>([]);
   let activeView = $state<"diff" | "result">("result");
   let matches = $state({ total: 0, matched: 0, percent: 0 });
 
   // ── Auto-fill khi mở tab ──────────────────────────────────────────────
   onMount(() => {
-    // Tự động generate SRT từ kết quả của AI nếu có
     if ($jobStore.segments && $jobStore.segments.length > 0) {
       textAI = generateSRTContent($jobStore.segments);
     }
   });
 
-  // ── Actions: File & Utils ─────────────────────────────────────────────
+  // ── File loaders ──────────────────────────────────────────────────────
   async function loadFile(target: "original" | "ai") {
     const filePath = await open({
       multiple: false,
-      filters: [{ name: "Text/SRT Files", extensions: ["txt", "srt"] }],
+      filters: [{ name: "Text/SRT", extensions: ["txt", "srt"] }],
     });
-    
     if (filePath && typeof filePath === "string") {
       const content = await readTextFile(filePath);
       if (target === "original") textOriginal = content;
@@ -39,102 +37,100 @@
     }
   }
 
-  async function openPurpleCulture() {
-    await openUrl("https://www.purpleculture.net/traditional-simplified-converter/");
+  // ── Helpers ───────────────────────────────────────────────────────────
+  function cleanCN(s: string) {
+    return (s || "").replace(/[^\u4e00-\u9fa5]/g, "");
   }
 
-  function cleanCN(s: string) { 
-    return (s || "").replace(/[^\u4e00-\u9fa5]/g, ""); 
-  }
-
-  // ── Logic 1: Diff-Match-Patch (Bỏ qua timestamp) ──────────────────────
+  // ── Logic 1: Diff so sánh ký tự Hán ──────────────────────────────────
+  // diff_main(a, b) → tính sự khác biệt từ a sang b
+  // Chúng ta muốn: INSERT = có trong Gốc nhưng thiếu ở AI, DELETE = AI thừa/sai
+  // Vậy diff_main(aiText, refText): INSERT = thêm vào để ra refText = có trong gốc thiếu ở AI ✓
   function runDiff() {
     const refText = cleanCN(textOriginal);
     const aiText = cleanCN(textAI);
 
     if (!refText || !aiText) {
-      alert("Vui lòng cung cấp văn bản chứa ký tự tiếng Trung hợp lệ!");
+      alert("Cần có ký tự tiếng Trung ở cả hai ô!");
       return;
     }
 
     const dmp = new DiffMatchPatch();
-    // dmp.Diff_Timeout = 0; 
-    const diffs = dmp.diff_main(aiText, refText); // Diff từ AI lên Gốc
+    const diffs = dmp.diff_main(aiText, refText);
     dmp.diff_cleanupSemantic(diffs);
-    
+
     diffTokens = diffs.map(([type, text]) => ({ type, text }));
-    
+
     let matched = 0;
     diffs.forEach(([op, txt]) => {
-        if (op === 0) matched += txt.length;
+      if (op === DIFF_EQUAL) matched += txt.length;
     });
 
     matches = {
-        total: refText.length,
-        matched: matched,
-        percent: refText.length > 0 ? (matched / refText.length) * 100 : 0
+      total: refText.length,
+      matched,
+      percent: refText.length > 0 ? (matched / refText.length) * 100 : 0,
     };
 
     activeView = "diff";
   }
 
-  // ── Logic 2: Đồng bộ thuật toán SRT ────────────────────
+  // ── Logic 2: Đồng bộ SRT — ghép chữ Hán từ Gốc vào Timestamp AI ─────
+  // Thuật toán: đếm ký tự Hán trong mỗi block AI → lấy đúng số đó từ Gốc → thay thế
+  // Giữ nguyên dấu câu / khoảng trắng của AI
   function syncSRT() {
-    // 1. Lọc toàn bộ chữ Hán từ bản gốc
     const refChars = Array.from(cleanCN(textOriginal));
-    
-    // 2. Chia block SRT của bản AI
     const blocks = textAI.trim().split(/\n\s*\n/);
-    let ci = 0; // Con trỏ cho refChars
+    let ci = 0;
 
-    const outBlocks = blocks.map(block => {
-      const lines = block.split('\n');
-      const tsIdx = lines.findIndex(l => l.includes('-->'));
-      if (tsIdx === -1) return block; // Không phải subtitle block
+    const outBlocks = blocks.map((block) => {
+      const lines = block.split("\n");
+      const tsIdx = lines.findIndex((l) => l.includes("-->"));
+      if (tsIdx === -1) return block;
 
       const subLines = lines.slice(tsIdx + 1);
-      
-      // Đếm chữ Hán trong block AI
-      const aiSubText = subLines.join('');
-      const aiCNCount = (aiSubText.match(/[\u4e00-\u9fa5]/g) || []).length;
+      const aiCNCount = (subLines.join("").match(/[\u4e00-\u9fa5]/g) || []).length;
 
-      // Lấy đúng số lượng chữ Hán tương ứng từ refChars
-      let newChars = '';
+      // Lấy đúng aiCNCount ký tự từ refChars
+      let newChars = "";
       for (let k = 0; k < aiCNCount && ci < refChars.length; k++, ci++) {
         newChars += refChars[ci];
       }
 
-      // Thay thế chữ Hán, giữ nguyên dấu câu/khoảng trắng
+      // Thay ký tự Hán, giữ nguyên dấu câu/số/latin
       let nci = 0;
-      const newSubLines = subLines.map(line => {
-        let nl = '';
+      const newSubLines = subLines.map((line) => {
+        let nl = "";
         for (const ch of line) {
           if (/[\u4e00-\u9fa5]/.test(ch)) {
             nl += nci < newChars.length ? newChars[nci++] : ch;
           } else {
-            nl += ch; // Dấu câu, số, chữ la-tinh...
+            nl += ch;
           }
         }
         return nl;
       });
 
-      // Lắp ráp lại block (Index + Timestamp + NewLines)
-      return [...lines.slice(0, tsIdx + 1), ...newSubLines].join('\n');
+      return [...lines.slice(0, tsIdx + 1), ...newSubLines].join("\n");
     });
 
-    textResult = outBlocks.join('\n\n');
+    textResult = outBlocks.join("\n\n");
     activeView = "result";
   }
 
-  // ── Xuất File ─────────────────────────────────────────────────────────
+  // ── Export ────────────────────────────────────────────────────────────
   async function downloadSRT() {
     if (!textResult) return;
-    const path = await save({ filters: [{ name: "SRT", extensions: ["srt"] }], defaultPath: "synced_result.srt" });
+    const path = await save({
+      filters: [{ name: "SRT", extensions: ["srt"] }],
+      defaultPath: "synced_result.srt",
+    });
     if (path) await writeTextFile(path, textResult);
   }
 
+  // Download toàn bộ textOriginal (raw), không strip ký tự
   function downloadTXT() {
-    const blob = new Blob([cleanCN(textOriginal)], { type: "text/plain" });
+    const blob = new Blob([textOriginal], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -142,205 +138,348 @@
     a.click();
     URL.revokeObjectURL(url);
   }
+
+  // Tỷ lệ màu cho badge
+  const pctColor = $derived(
+    matches.percent >= 90 ? "#34d399"
+    : matches.percent >= 70 ? "#fbbf24"
+    : "#f87171"
+  );
 </script>
 
-<div class="compare-layout h-full flex flex-col gap-5 p-6 overflow-hidden">
-  
-  <!-- Header Actions -->
-  <div class="action-bar flex justify-between items-center bg-[#13141c]/50 backdrop-blur-md border border-[#2a2d3e] p-4 rounded-xl shadow-lg">
-    <div class="flex gap-3">
-        <button class="btn btn-outline flex items-center gap-2" onclick={openPurpleCulture}>
-            <span class="icon">🌐</span> Web Giản/Phồn thể
-        </button>
-    </div>
-    
-    <div class="flex gap-3">
-      <button class="btn btn-secondary flex items-center gap-2" onclick={runDiff} disabled={!textOriginal || !textAI}>
-        <span class="icon">🔍</span> So Sánh Text
+<div class="wrap">
+
+  <!-- ── Toolbar ── -->
+  <div class="toolbar">
+    <button class="btn btn-ghost" onclick={() => openUrl("https://www.purpleculture.net/traditional-simplified-converter/")}>
+      🌐 Giản/Phồn
+    </button>
+
+    <div class="toolbar-right">
+      <button class="btn btn-secondary" onclick={runDiff} disabled={!textOriginal || !textAI}>
+        🔍 So sánh
       </button>
-      <button class="btn btn-primary flex items-center gap-2" onclick={syncSRT} disabled={!textOriginal || !textAI}>
-        <span class="icon">✨</span> Đồng Bộ SRT
+      <button class="btn btn-primary" onclick={syncSRT} disabled={!textOriginal || !textAI}>
+        ✨ Đồng bộ SRT
       </button>
     </div>
   </div>
 
-  <!-- Input Grid -->
-  <div class="grid grid-cols-2 gap-5 h-[30%] min-h-[220px]">
-    <div class="input-panel col-original flex flex-col gap-2">
-      <div class="panel-header flex justify-between items-center px-1">
-        <span class="label-text">Kịch Bản Gốc (Tham chiếu)</span>
-        <button class="btn-text" onclick={() => loadFile('original')}>Tải file txt...</button>
+  <!-- ── Input panels ── -->
+  <div class="inputs">
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-label">Kịch bản gốc</span>
+        <button class="link-btn" onclick={() => loadFile("original")}>Tải .txt</button>
       </div>
-      <div class="textarea-wrap flex-1">
-        <textarea 
-            class="custom-textarea" 
-            bind:value={textOriginal} 
-            placeholder="Dán text gốc vào đây để làm dữ liệu nguồn..."
-        ></textarea>
-      </div>
+      <textarea
+        class="ta"
+        bind:value={textOriginal}
+        placeholder="Dán kịch bản gốc vào đây…"
+      ></textarea>
     </div>
-    
-    <div class="input-panel col-ai flex flex-col gap-2">
-      <div class="panel-header flex justify-between items-center px-1">
-        <span class="label-text">Văn Bản AI (SRT / Whisper)</span>
-        <button class="btn-text" onclick={() => loadFile('ai')}>Tải file srt...</button>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-label">Bản AI / Whisper</span>
+        <button class="link-btn" onclick={() => loadFile("ai")}>Tải .srt</button>
       </div>
-      <div class="textarea-wrap flex-1">
-        <textarea 
-            class="custom-textarea" 
-            bind:value={textAI} 
-            placeholder="Nội dung AI sẽ tự động hiện ở đây sau khi Transcribe xong..."
-        ></textarea>
-      </div>
+      <textarea
+        class="ta"
+        bind:value={textAI}
+        placeholder="SRT từ Whisper sẽ tự điền sau khi transcribe…"
+      ></textarea>
     </div>
   </div>
 
-  <!-- Results View -->
-  <div class="results-container flex-1 flex flex-col min-h-0 bg-[#0e1016] border border-[#2a2d3e] rounded-xl overflow-hidden shadow-inner">
-    <div class="results-header flex justify-between items-center p-4 border-b border-[#2a2d3e] bg-[#13141c]/40">
-      <div class="flex items-center gap-4">
-          <h3 class="results-title">
-            {activeView === 'diff' ? 'Kết Quả So Sánh' : 'Kết Quả SRT Đồng Bộ'}
-          </h3>
-          {#if activeView === 'diff' && matches.total > 0}
-            <div class="stats-badge">
-                <span class="pct">{Math.round(matches.percent)}%</span>
-                <span class="detail">{matches.matched}/{matches.total} chữ đúng</span>
-            </div>
-          {/if}
-      </div>
-      
-      <div class="flex gap-2">
-          {#if activeView === 'result' && textResult}
-            <button class="btn btn-secondary btn-sm" onclick={downloadTXT}>⬇ Tải TXT</button>
-            <button class="btn btn-primary btn-sm" onclick={downloadSRT}>⬇ Tải SRT</button>
-          {/if}
-      </div>
-    </div>
+  <!-- ── Result panel ── -->
+  <div class="result-wrap">
+    <div class="result-head">
+      <div class="result-title-row">
+        <span class="result-label">
+          {activeView === "diff" ? "So sánh" : "Kết quả SRT"}
+        </span>
 
-    <div class="view-content flex-1 overflow-y-auto p-6 scroll-smooth">
-      {#if activeView === 'diff'}
-        <div class="diff-view font-serif text-xl leading-relaxed">
-            {#if diffTokens.length > 0}
-                {#each diffTokens as token}
-                    {#if token.type === DIFF_EQUAL}
-                        <span class="token-equal">{token.text}</span>
-                    {:else if token.type === DIFF_INSERT}
-                        <span class="token-insert" title="Có trong gốc, thiếu trong AI">{token.text}</span>
-                    {:else if token.type === DIFF_DELETE}
-                        <span class="token-delete" title="AI nghe nhầm/thừa">{token.text}</span>
-                    {/if}
-                {/each}
-            {:else}
-                <div class="empty-state">
-                    Nhấn "So Sánh Text" để xem sự khác biệt giữa AI và Bản Gốc.
-                </div>
-            {/if}
+        {#if activeView === "diff" && matches.total > 0}
+          <span class="badge" style="--c: {pctColor}">
+            <span class="badge-pct">{Math.round(matches.percent)}%</span>
+            <span class="badge-detail">{matches.matched}/{matches.total}</span>
+          </span>
+        {/if}
+      </div>
+
+      {#if activeView === "result" && textResult}
+        <div class="result-actions">
+          <button class="btn btn-sm btn-ghost" onclick={downloadTXT}>⬇ TXT</button>
+          <button class="btn btn-sm btn-primary" onclick={downloadSRT}>⬇ SRT</button>
         </div>
+      {/if}
+    </div>
+
+    <div class="result-body">
+      {#if activeView === "diff"}
+        {#if diffTokens.length > 0}
+          <div class="diff-view">
+            {#each diffTokens as token}
+              {#if token.type === DIFF_EQUAL}
+                <span class="t-eq">{token.text}</span>
+              {:else if token.type === DIFF_INSERT}
+                <span class="t-ins" title="Có trong gốc, thiếu ở AI">{token.text}</span>
+              {:else if token.type === DIFF_DELETE}
+                <span class="t-del" title="AI nghe thừa/sai">{token.text}</span>
+              {/if}
+            {/each}
+          </div>
+        {:else}
+          <div class="empty">Nhấn "So sánh" để xem sự khác biệt.</div>
+        {/if}
+
       {:else}
         {#if textResult}
-          <pre class="srt-preview whitespace-pre-wrap font-mono text-sm leading-relaxed">{textResult}</pre>
+          <pre class="srt-pre">{textResult}</pre>
         {:else}
-          <div class="empty-state grayscale opacity-50">
-            <div class="icon">✨</div>
-            <p>Nhấn "Đồng Bộ SRT" để ghép chữ từ Bản Gốc vào Timestamp của Bản AI.</p>
-            <p class="sub">Thuật toán sẽ tự động khớp từng ký tự tiếng Trung một cách chính xác.</p>
+          <div class="empty">
+            <div class="empty-icon">✨</div>
+            <p>Nhấn "Đồng bộ SRT" để ghép chữ từ bản gốc vào timestamp của AI.</p>
           </div>
         {/if}
       {/if}
     </div>
   </div>
+
 </div>
 
 <style>
-  /* Layout & Panels */
-  .compare-layout {
+  .wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    height: 100%;
+    padding: 1rem 1.25rem;
+    overflow: hidden;
     font-family: 'Inter', -apple-system, sans-serif;
-    animation: fadeIn 0.3s ease-out;
+    animation: fadeIn 0.25s ease-out;
   }
 
   @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(10px); }
-    to { opacity: 1; transform: translateY(0); }
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
   }
 
-  .input-panel {
+  /* ── Toolbar ── */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #13141c;
+    border: 1px solid #2a2d3e;
+    border-radius: 10px;
+    padding: 0.5rem 0.75rem;
+    flex-shrink: 0;
+  }
+
+  .toolbar-right {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  /* ── Inputs ── */
+  .inputs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    flex: 0 0 28%;
+    min-height: 180px;
+  }
+
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
     min-width: 0;
   }
 
-  .label-text {
-    font-size: 0.75rem;
-    font-weight: 700;
-    color: #6b7194;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+  .panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 2px;
   }
 
-  .btn-text {
+  .panel-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: #555a7a;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .link-btn {
     font-size: 0.7rem;
     color: #7c8cf8;
     background: none;
     border: none;
     cursor: pointer;
     font-weight: 600;
+    padding: 0;
   }
+  .link-btn:hover { text-decoration: underline; }
 
-  .btn-text:hover {
-    text-decoration: underline;
-  }
-
-  /* Components */
-  .custom-textarea {
+  .ta {
+    flex: 1;
     width: 100%;
-    height: 100%;
     background: #1a1b28;
     border: 1px solid #2a2d3e;
-    border-radius: 10px;
-    padding: 1rem;
+    border-radius: 8px;
+    padding: 0.75rem;
     color: #c4c8e2;
-    font-size: 1rem;
+    font-size: 0.95rem;
     font-family: 'Songti SC', 'SimSun', serif;
     line-height: 1.6;
     resize: none;
     outline: none;
-    transition: all 0.2s ease;
-    box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
+    transition: border-color 0.2s, box-shadow 0.2s;
   }
-
-  .custom-textarea:focus {
+  .ta:focus {
     border-color: #7c8cf8;
-    background: #1e1f2f;
-    box-shadow: 0 0 0 3px rgba(124, 140, 248, 0.15), inset 0 2px 4px rgba(0,0,0,0.2);
+    box-shadow: 0 0 0 2px rgba(124,140,248,0.15);
   }
 
-  .btn {
-    padding: 0.6rem 1.2rem;
-    border-radius: 8px;
-    font-size: 0.875rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  /* ── Result ── */
+  .result-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: #0e1016;
+    border: 1px solid #2a2d3e;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  .result-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 0.85rem;
+    border-bottom: 1px solid #2a2d3e;
+    background: #13141c;
+    flex-shrink: 0;
+  }
+
+  .result-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  .result-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .badge {
     display: inline-flex;
     align-items: center;
-    justify-content: center;
+    gap: 0.3rem;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 999px;
+    padding: 0.1rem 0.5rem;
+  }
+  .badge-pct {
+    color: var(--c, #7c8cf8);
+    font-weight: 800;
+    font-size: 0.72rem;
+  }
+  .badge-detail {
+    color: #475569;
+    font-size: 0.67rem;
   }
 
-  .btn-sm {
-    padding: 0.4rem 0.8rem;
-    font-size: 0.75rem;
+  .result-actions { display: flex; gap: 0.4rem; }
+
+  .result-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem 1.25rem;
   }
+
+  /* ── Diff ── */
+  .diff-view {
+    font-family: 'Songti SC', 'SimSun', serif;
+    font-size: 1.15rem;
+    line-height: 1.9;
+    color: #8b92b8;
+    word-break: break-all;
+  }
+  .t-eq  { opacity: 0.75; }
+  .t-ins {
+    background: rgba(16,185,129,0.12);
+    color: #34d399;
+    border-bottom: 2px solid rgba(16,185,129,0.3);
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+  .t-del {
+    background: rgba(239,68,68,0.12);
+    color: #f87171;
+    text-decoration: line-through;
+    opacity: 0.65;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+
+  .srt-pre {
+    color: #e2e8f0;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    margin: 0;
+  }
+
+  /* ── Empty ── */
+  .empty {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: #3d4466;
+    gap: 0.4rem;
+    font-size: 0.875rem;
+  }
+  .empty-icon { font-size: 2rem; margin-bottom: 0.5rem; }
+
+  /* ── Buttons ── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.45rem 0.9rem;
+    border-radius: 7px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+  .btn:disabled { opacity: 0.35; cursor: not-allowed; filter: grayscale(1); }
 
   .btn-primary {
     background: linear-gradient(135deg, #7c8cf8, #a78bfa);
-    color: white;
-    border: none;
-    box-shadow: 0 4px 12px rgba(124, 140, 248, 0.3);
+    color: #fff;
+    box-shadow: 0 3px 10px rgba(124,140,248,0.25);
   }
-
   .btn-primary:hover:not(:disabled) {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 16px rgba(124, 140, 248, 0.4);
     filter: brightness(1.1);
+    box-shadow: 0 4px 14px rgba(124,140,248,0.4);
   }
 
   .btn-secondary {
@@ -348,111 +487,20 @@
     color: #a5b4fc;
     border: 1px solid #3a3e5c;
   }
+  .btn-secondary:hover:not(:disabled) { background: #2d3254; border-color: #4c5277; }
 
-  .btn-secondary:hover:not(:disabled) {
-    background: #2d3254;
-    border-color: #4c5277;
-  }
-
-  .btn-outline {
+  .btn-ghost {
     background: transparent;
+    color: #8892b0;
     border: 1px solid #2a2d3e;
-    color: #c4c8e2;
   }
+  .btn-ghost:hover:not(:disabled) { background: rgba(255,255,255,0.04); color: #c4c8e2; }
 
-  .btn-outline:hover:not(:disabled) {
-    background: rgba(255,255,255,0.05);
-    border-color: #4b5563;
-  }
+  .btn-sm { padding: 0.3rem 0.65rem; font-size: 0.75rem; }
 
-  .btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-    filter: grayscale(1);
-  }
-
-  /* Tokens & Diff View */
-  .diff-view {
-    color: #8b92b8;
-  }
-
-  .token-equal {
-    opacity: 0.8;
-  }
-
-  .token-insert {
-    background: rgba(16, 185, 129, 0.15);
-    color: #34d399;
-    border-bottom: 2px solid rgba(16, 185, 129, 0.3);
-    padding: 0 2px;
-    border-radius: 2px;
-  }
-
-  .token-delete {
-    background: rgba(239, 68, 68, 0.15);
-    color: #f87171;
-    text-decoration: line-through;
-    padding: 0 2px;
-    border-radius: 2px;
-    opacity: 0.6;
-  }
-
-  .results-title {
-    font-size: 0.875rem;
-    font-weight: 700;
-    color: #94a3b8;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-
-  .stats-badge {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      background: rgba(124, 140, 248, 0.1);
-      border: 1px solid rgba(124, 140, 248, 0.2);
-      padding: 0.2rem 0.6rem;
-      border-radius: 20px;
-  }
-
-  .stats-badge .pct {
-      color: #7c8cf8;
-      font-weight: 800;
-      font-size: 0.75rem;
-  }
-
-  .stats-badge .detail {
-      color: #64748b;
-      font-size: 0.7rem;
-      font-weight: 500;
-  }
-
-  .empty-state {
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-    color: #475569;
-    gap: 0.5rem;
-  }
-
-  .empty-state .icon {
-    font-size: 3rem;
-    margin-bottom: 1rem;
-  }
-
-  .empty-state p { font-size: 0.95rem; font-weight: 500; }
-  .empty-state .sub { font-size: 0.8rem; opacity: 0.7; }
-
-  .srt-preview {
-    color: #e2e8f0;
-  }
-
-  /* Custom Scrollbar */
-  ::-webkit-scrollbar { width: 8px; }
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #2a2d3e; border-radius: 10px; }
+  ::-webkit-scrollbar-thumb { background: #2a2d3e; border-radius: 6px; }
   ::-webkit-scrollbar-thumb:hover { background: #3a3e5c; }
 </style>
