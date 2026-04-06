@@ -276,10 +276,16 @@ pub async fn run(
         let (tx, mut rx) = mpsc::channel::<ffmpeg::FfmpegProgress>(32);
         let a2 = app.clone(); let j2 = job_mgr.clone();
         tokio::spawn(async move {
+            let mut last_emit = std::time::Instant::now();
+            let mut last_s = -1.0;
             while let Some(p) = rx.recv().await {
                 let s = 5.0 + p.percent * 0.15; // 5% → 20%
-                emit(&a2, "Extracting audio", s, 0);
-                j2.update_progress("Extracting audio", s);
+                if s - last_s >= 1.0 || last_emit.elapsed().as_millis() > 300 {
+                    emit(&a2, "Extracting audio", s, 0);
+                    j2.update_progress("Extracting audio", s);
+                    last_s = s;
+                    last_emit = std::time::Instant::now();
+                }
             }
         });
         let sc = app.shell().sidecar("ffmpeg")
@@ -376,10 +382,16 @@ pub async fn run(
         let (tx, mut rx) = mpsc::channel::<WhisperNativeProgress>(32);
         let a2 = app.clone(); let j2 = job_mgr.clone();
         tokio::spawn(async move {
+            let mut last_emit = std::time::Instant::now();
+            let mut last_s = -1.0;
             while let Some(p) = rx.recv().await {
                 let s = pstart + (p.percent / 100.0) * (pend - pstart);
-                emit(&a2, "Transcribing", s, 0);
-                j2.update_progress("Transcribing", s);
+                if s - last_s >= 1.0 || last_emit.elapsed().as_millis() > 300 {
+                    emit(&a2, "Transcribing", s, 0);
+                    j2.update_progress("Transcribing", s);
+                    last_s = s;
+                    last_emit = std::time::Instant::now();
+                }
             }
         });
 
