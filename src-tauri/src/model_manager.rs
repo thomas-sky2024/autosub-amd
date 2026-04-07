@@ -1,9 +1,17 @@
 use std::path::PathBuf;
 use std::fs;
+use std::sync::Mutex;
+use std::collections::HashSet;
 use log::{debug, warn, info};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use futures_util::StreamExt;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Theo dõi các model đang được tải để tránh tải trùng lặp
+    static ref ACTIVE_DOWNLOADS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelItem {
@@ -53,20 +61,21 @@ impl ModelManager {
     /// Returns the canonical absolute path to the models directory.
     /// Uses standard OS AppData directory to comply with system conventions.
     fn models_directory() -> PathBuf {
-        let base_dir = dirs::data_local_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let autosub_dir = home.join(".autosub");
+        let models_dir = autosub_dir.join("models");
 
-        // Standard AppData directory matching Tauri's default
-        let app_data_dir = base_dir.join("com.autosub.app");
-        let models_dir = app_data_dir.join("models");
+        // [MIGRATION LOGIC] Automatically migrate models from old Application Support location to ~/.autosub/models
+        if let Some(data_dir) = dirs::data_local_dir() {
+            let old_data_dir = data_dir.join("com.autosub.app");
+            let old_models_dir = old_data_dir.join("models");
 
-        // [MIGRATION LOGIC] Automatically migrate models from old ~/.autosub directory
-        let old_models_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".autosub").join("models");
-        if old_models_dir.exists() && !models_dir.exists() {
-            log::info!("Migrating models from {:?} to {:?}", old_models_dir, models_dir);
-            let _ = fs::create_dir_all(&app_data_dir);
-            if let Err(e) = fs::rename(&old_models_dir, &models_dir) {
-                warn!("Failed to migrate models: {}", e);
+            if old_models_dir.exists() && !models_dir.exists() {
+                log::info!("Migrating models from {:?} to {:?}", old_models_dir, models_dir);
+                let _ = fs::create_dir_all(&autosub_dir);
+                if let Err(e) = fs::rename(&old_models_dir, &models_dir) {
+                    warn!("Failed to migrate models: {}", e);
+                }
             }
         }
 
@@ -77,6 +86,7 @@ impl ModelManager {
         debug!("model_manager: models_directory -> {:?}", models_dir);
         models_dir
     }
+
 
     /// Returns a centralized list of supported model specifications for this hardware (Mac Intel i9 + AMD 555X).
     pub fn get_available_models() -> Vec<ModelItem> {
@@ -276,6 +286,16 @@ pub async fn download_model_by_id(model_id: String, app: AppHandle) -> Result<()
         })
         .ok_or_else(|| format!("Không tìm thấy model spec: {}", model_id))?;
 
+    // KIỂM TRA ĐANG TẢI (TRÁNH TRANH CHẤP)
+    {
+        let mut active = ACTIVE_DOWNLOADS.lock().map_err(|_| "Lỗi lock ACTIVE_DOWNLOADS".to_string())?;
+        if active.contains(&model_id) {
+            warn!("model_manager: {} đang được tải rồi, bỏ qua yêu cầu mới", model_id);
+            return Err(format!("Model {} đang được tải, vui lòng đợi.", model_id));
+        }
+        active.insert(model_id.clone());
+    }
+
     let models_dir = ModelManager::models_directory();
     fs::create_dir_all(&models_dir)
         .map_err(|e| format!("Không thể tạo thư mục models: {}", e))?;
@@ -317,6 +337,13 @@ pub async fn download_model_by_id(model_id: String, app: AppHandle) -> Result<()
             &model_id_clone,
             app_clone.clone(),
         ).await;
+
+        // GIẢI PHÓNG TRẠNG THÁI ĐANG TẢI
+        {
+            if let Ok(mut active) = ACTIVE_DOWNLOADS.lock() {
+                active.remove(&model_id_clone);
+            }
+        }
 
         match result {
             Ok(_) => {

@@ -12,6 +12,8 @@ use whisper_rs::{
     DtwMode, DtwModelPreset, FullParams, SamplingStrategy,
     WhisperContext, WhisperContextParameters,
 };
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -139,11 +141,13 @@ impl WhisperEngine {
         language: &str,
         threads: Option<usize>,
         progress_tx: Option<mpsc::Sender<WhisperNativeProgress>>,
+        abort_flag: Option<Arc<AtomicBool>>,
     ) -> Result<Vec<Segment>> {
         let ctx = self.ctx.clone();
         let language = language.to_string();
         let n_threads = threads.unwrap_or_else(ModelVariant::recommended_threads);
         let has_dtw = self.variant.has_dtw();
+        let abort_flag_cb = abort_flag.clone();
 
         let result = tokio::task::spawn_blocking(move || {
             let mut state = ctx.create_state().map_err(|e| {
@@ -179,6 +183,13 @@ impl WhisperEngine {
                     });
                 }
             });
+
+            if let Some(ref abort) = abort_flag_cb {
+                unsafe {
+                    params.set_abort_callback(Some(whisper_abort_callback));
+                    params.set_abort_callback_user_data(Arc::as_ptr(abort) as *mut c_void);
+                }
+            }
 
             // Fix WHISPER_ASSERT: filter_width < a->ne[2]
             //
@@ -262,6 +273,15 @@ impl WhisperEngine {
     pub fn model_path(&self) -> &str {
         &self.model_path
     }
+}
+// ── Abort Callback ────────────────────────────────────────────────────────────
+
+unsafe extern "C" fn whisper_abort_callback(user_data: *mut c_void) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+    let abort_flag = &*(user_data as *const AtomicBool);
+    abort_flag.load(Ordering::SeqCst)
 }
 
 const fn is_apple_silicon() -> bool {

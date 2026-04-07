@@ -166,7 +166,7 @@ async fn clear_cache() -> Result<(), error::AutoSubError> {
 pub fn run() {
     env_logger::init();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -190,33 +190,38 @@ pub fn run() {
             model_manager::download_model_by_id,
             model_manager::download_vad_model,
             model_manager::open_models_dir,
-        ])
-        // Drop WhisperContext (Metal GPU resources) trước khi process exit.
-        // Nếu không, ggml_metal_rsets_free() assert fail vì residency sets
-        // chưa được deallocate → crash log khi tắt app (Cmd+Q hoặc nút đóng).
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                log::info!("lib: window destroyed, setting exit flag");
-                let state = window.state::<AppState>();
-                state.inner.exit_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                
-                // Abort bất kỳ task nào đang chạy
-                state.inner.job_manager.cancel();
+        ]);
 
-                log::info!("lib: dropping whisper engine manually");
-                if let Ok(mut engine) = state.inner.whisper_engine.try_lock() {
-                    *engine = None;
-                } else {
-                    log::warn!("lib: whisper engine is locked (task running), forcing drop to prevent ggml abort");
-                    // Forcefully drop it using blocking_lock since we are shutting down
-                    let mut engine = state.inner.whisper_engine.blocking_lock();
-                    *engine = None;
-                }
-                
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building AutoSub v2");
+
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } => {
+            log::info!("lib: ExitRequested, performing final cleanup");
+            let state = app_handle.state::<AppState>();
+            
+            // 1. Tín hiệu dừng cho engine và pipeline
+            state.inner.exit_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            state.inner.job_manager.cancel();
+
+            // 2. Giải phóng Whisper Engine (Metal resources)
+            // Dùng blocking_lock vì chúng ta đang trong sync thread của tauri run
+            log::info!("lib: dropping whisper engine");
+            {
+                let mut engine = state.inner.whisper_engine.blocking_lock();
+                *engine = None;
+            }
+            {
                 let mut loaded = state.inner.loaded_model.blocking_lock();
                 loaded.clear();
             }
-        })
-        .run(tauri::generate_context!())
-        .expect("error while running AutoSub v2");
+
+            // 3. Đợi một chút để spawn_blocking threads kịp thoát và drop Arc clones
+            // Điều này cực kỳ quan trọng trên macOS để tránh ggml_metal crash khi process exit
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            log::info!("lib: cleanup complete, exiting");
+        }
+        _ => {}
+    });
 }

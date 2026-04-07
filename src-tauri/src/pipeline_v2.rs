@@ -398,7 +398,7 @@ pub async fn run(
         // language=None mỗi batch → auto-detect → fix multilingual drift
         let batch_lang = if lang == "auto" || lang.is_empty() { "auto" } else { lang.as_str() };
 
-        let mut segs = engine.transcribe(batch.samples, batch_lang, None, Some(tx)).await?;
+        let mut segs = engine.transcribe(batch.samples, batch_lang, None, Some(tx), Some(state.exit_flag.clone())).await?;
 
         // Cộng offset batch về timeline gốc video
         // Đây là bước quan trọng nhất để kết quả các batch khớp timeline

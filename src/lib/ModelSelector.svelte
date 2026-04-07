@@ -39,6 +39,7 @@
   }
 
   async function handleDownload(id: string) {
+    if (isDownloading(id, downloadProgress)) return;
     delete downloadErrors[id];
     downloadErrors = { ...downloadErrors };
     downloadProgress = {
@@ -60,8 +61,8 @@
     activeModelFilename = filename;
   }
 
-  function isDownloading(id: string): boolean {
-    const p = downloadProgress[id];
+  function isDownloading(id: string, progress: Record<string, DownloadProgress>): boolean {
+    const p = progress[id];
     return !!p && !p.done;
   }
 
@@ -116,7 +117,7 @@
   <div class="model-grid">
     {#each models as model}
       {@const prog = downloadProgress[model.id]}
-      {@const downloading = isDownloading(model.id)}
+      {@const downloading = isDownloading(model.id, downloadProgress)}
       {@const error = downloadErrors[model.id]}
       {@const isSelected = activeModelFilename === model.filename}
 
@@ -161,7 +162,11 @@
                 </button>
               {/if}
             {:else}
-              <button class="btn btn-download" on:click={() => handleDownload(model.id)}>
+              <button 
+                class="btn btn-download" 
+                on:click={() => handleDownload(model.id)}
+                disabled={downloading}
+              >
                 <svg class="icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                 Tải ngay
               </button>
