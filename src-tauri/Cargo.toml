@@ -1,6 +1,6 @@
 [package]
 name = "auto-sub"
-version = "0.1.2"
+version = "0.1.4"
 description = "AutoSub – Native macOS subtitle generator"
 authors = ["thomas-sky2024"]
 edition = "2021"
