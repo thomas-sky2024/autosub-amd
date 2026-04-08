@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A single subtitle segment with timing and text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)] // ← thêm Default vào đây
 pub struct Segment {
     pub start: f32,
     pub end: f32,
