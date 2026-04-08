@@ -39,7 +39,7 @@ env_logger = "0.11"
 sherpa-onnx = "1.12.34"
 
 # Native Whisper 
-whisper-rs = { version = "0.16", features = ["metal"] }
+whisper-cpp-plus = { version = "0.1", features = ["metal"] }
 
 # Audio decoding in-process
 hound = "3.5"
