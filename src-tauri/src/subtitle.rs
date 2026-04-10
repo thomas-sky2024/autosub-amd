@@ -1,94 +1,135 @@
-use serde::{Deserialize, Serialize};
+//! Native Whisper — whisper-cpp-plus (non-streaming)
+//! Tối ưu cho cả Mac Intel 2019 (AMD GPU) và Apple Silicon
+//! Hỗ trợ build universal-apple-darwin
 
-/// A single subtitle segment with timing and text.
-#[derive(Debug, Clone, Default)] // ← thêm Default vào đây
-pub struct Segment {
-    pub start: f32,
-    pub end: f32,
-    pub text: String,
+use crate::error::{AutoSubError, Result};
+use crate::subtitle::Segment;
+use log::info;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use whisper_cpp_plus::{TranscriptionParams, WhisperContext};
+use std::time::Instant;
+use num_cpus;
+
+// ── Hardware Detection ─────────────────────────────────────────────────────
+
+fn is_apple_silicon() -> bool {
+    cfg!(target_arch = "aarch64") && cfg!(target_os = "macos")
 }
 
-impl Segment {
-    pub fn duration(&self) -> f32 {
-        self.end - self.start
-    }
-
-    /// Characters per second.
-    pub fn cps(&self) -> f32 {
-        let d = self.duration();
-        if d <= 0.0 {
-            return 0.0;
-        }
-        self.text.chars().count() as f32 / d
-    }
+fn is_intel_mac_amd() -> bool {
+    cfg!(target_arch = "x86_64") && !is_apple_silicon()
 }
 
-/// Format a float seconds value into SRT timestamp: HH:MM:SS,mmm
-fn format_srt_time(seconds: f32) -> String {
-    let total_ms = (seconds * 1000.0).round() as u64;
-    let h = total_ms / 3_600_000;
-    let m = (total_ms % 3_600_000) / 60_000;
-    let s = (total_ms % 60_000) / 1000;
-    let ms = total_ms % 1000;
-    format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
+// ── Types ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct WhisperNativeProgress {
+    pub percent: f32,
+    pub segment_count: usize,
 }
 
-/// Serialize segments into SRT format.
-pub fn to_srt(segments: &[Segment]) -> String {
-    let mut output = String::new();
-    for (i, seg) in segments.iter().enumerate() {
-        output.push_str(&format!("{}\n", i + 1));
-        output.push_str(&format!(
-            "{} --> {}\n",
-            format_srt_time(seg.start),
-            format_srt_time(seg.end)
-        ));
-        output.push_str(&seg.text);
-        output.push_str("\n\n");
-    }
-    output
+// ── Engine ─────────────────────────────────────────────────────────────────
+
+pub struct WhisperEngine {
+    ctx: Arc<WhisperContext>,
 }
 
-/// Serialize segments into plain text (one line per segment).
-pub fn to_txt(segments: &[Segment]) -> String {
-    segments
-        .iter()
-        .map(|s| s.text.clone())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_srt_timestamp() {
-        assert_eq!(format_srt_time(0.0), "00:00:00,000");
-        assert_eq!(format_srt_time(61.5), "00:01:01,500");
-        assert_eq!(format_srt_time(3661.123), "01:01:01,123");
-    }
-
-    #[test]
-    fn test_cps() {
-        let seg = Segment {
-            start: 0.0,
-            end: 2.0,
-            text: "Hello".to_string(),
+impl WhisperEngine {
+    pub fn load(model_path: &str) -> Result<Self> {
+        let hardware = if is_apple_silicon() {
+            "Apple Silicon (M1/M2/M3/M4)"
+        } else if is_intel_mac_amd() {
+            "Intel 2019 + AMD GPU"
+        } else {
+            "Unknown"
         };
-        assert!((seg.cps() - 2.5).abs() < 0.01);
+
+        info!("🔧 WhisperEngine init → Hardware: {}", hardware);
+
+        if is_apple_silicon() {
+            std::env::set_var("GGML_METAL_N_CB", "4");
+            std::env::set_var("GGML_METAL_MAX_BUFFER_SIZE", "32212254720");
+            std::env::set_var("GGML_METAL_USE_IO", "1");
+            std::env::set_var("GGML_METAL_F16", "1");
+        } else if is_intel_mac_amd() {
+            std::env::set_var("GGML_METAL_N_CB", "2");
+            std::env::set_var("GGML_METAL_MAX_BUFFER_SIZE", "2147483648");
+            std::env::set_var("GGML_METAL_MPS", "0");
+        }
+
+        let ctx = WhisperContext::new(model_path)
+            .map_err(|e| AutoSubError::WhisperDecode(format!("Load model failed: {}", e)))?;
+
+        info!("✅ Model loaded successfully on Metal ({})", hardware);
+        Ok(Self { ctx: Arc::new(ctx) })
     }
 
-    #[test]
-    fn test_to_srt() {
-        let segs = vec![Segment {
-            start: 1.0,
-            end: 3.5,
-            text: "Hello world".to_string(),
-        }];
-        let srt = to_srt(&segs);
-        assert!(srt.contains("1\n"));
-        assert!(srt.contains("00:00:01,000 --> 00:00:03,500"));
-        assert!(srt.contains("Hello world"));
+    pub async fn transcribe(
+        &self,
+        samples: Vec<f32>,
+        language: &str,
+        threads: Option<usize>,
+        progress_tx: Option<mpsc::Sender<WhisperNativeProgress>>,
+        _abort_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Vec<Segment>> {
+        let ctx = self.ctx.clone();
+        
+        // Chuyển thành owned String để move vào spawn_blocking
+        let lang: Option<String> = if language == "auto" || language.is_empty() {
+            None
+        } else {
+            Some(language.to_string())
+        };
+
+        let n_threads = threads.unwrap_or_else(|| {
+            if is_apple_silicon() {
+                num_cpus::get_physical().max(1)
+            } else {
+                4
+            }
+        });
+
+        let start = Instant::now();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Segment>> {
+            let params = TranscriptionParams::builder()
+                .language(lang.as_deref().unwrap_or(""))
+                .n_threads(n_threads as i32)
+                .enable_timestamps()
+                .build();
+
+            let transcription = ctx.transcribe_with_params(&samples, params)
+                .map_err(|e| AutoSubError::WhisperDecode(e.to_string()))?;
+
+            let segments: Vec<Segment> = transcription
+                .segments
+                .into_iter()
+                .map(|s| Segment {
+                    start: s.start_ms as f32 / 1000.0,
+                    end: s.end_ms as f32 / 1000.0,
+                    text: s.text,
+                    ..Default::default()
+                })
+                .collect();
+
+            if let Some(tx) = &progress_tx {
+                let _ = tx.try_send(WhisperNativeProgress {
+                    percent: 100.0,
+                    segment_count: segments.len(),
+                });
+            }
+
+            info!("Transcription completed in {:.2}s on {}", 
+                start.elapsed().as_secs_f32(), 
+                if is_apple_silicon() { "Apple Silicon" } else { "Intel AMD" }
+            );
+
+            Ok(segments)
+        })
+        .await
+        .map_err(|e| AutoSubError::WhisperDecode(format!("Task panicked: {}", e)))??;
+
+        Ok(result)
     }
 }

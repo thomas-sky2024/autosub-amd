@@ -1,40 +1,27 @@
-//! Native Whisper — whisper-cpp-plus (whisper.cpp v1.8.x) + Streaming API
-//! Tối ưu cho Mac Intel 2019 (AMD) và Mac M1/M2/M3/M4
+//! Native Whisper — whisper-cpp-plus (non-streaming)
+//! Tối ưu cho cả Mac Intel 2019 (AMD GPU) và Apple Silicon
+//! Hỗ trợ build universal-apple-darwin
 
 use crate::error::{AutoSubError, Result};
 use crate::subtitle::Segment;
 use log::info;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use whisper_cpp_plus::{FullParams, SamplingStrategy, WhisperContext, WhisperStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use whisper_cpp_plus::{TranscriptionParams, WhisperContext};
+use std::time::Instant;
 use num_cpus;
 
-// ── Hardware Detection & Safe GPU Layers ─────────────────────────────────────
-
-fn is_intel_mac_amd() -> bool {
-    cfg!(target_arch = "x86_64") && !is_apple_silicon()
-}
+// ── Hardware Detection ─────────────────────────────────────────────────────
 
 fn is_apple_silicon() -> bool {
     cfg!(target_arch = "aarch64") && cfg!(target_os = "macos")
 }
 
-fn get_safe_gpu_layers(variant: &ModelVariant) -> i32 {
-    if is_intel_mac_amd() {
-        match variant {
-            ModelVariant::LargeV3Turbo => 28,
-            ModelVariant::LargeV3 | ModelVariant::LargeV2 => 16,
-            _ => 12,
-        }
-    } else if is_apple_silicon() {
-        99
-    } else {
-        0
-    }
+fn is_intel_mac_amd() -> bool {
+    cfg!(target_arch = "x86_64") && !is_apple_silicon()
 }
 
-// ── Types ─────────────────────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct WhisperNativeProgress {
@@ -42,53 +29,30 @@ pub struct WhisperNativeProgress {
     pub segment_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ModelVariant {
-    LargeV2,
-    LargeV3,
-    LargeV3Turbo,
-    Unknown,
-}
-
-impl ModelVariant {
-    pub fn from_path(path: &str) -> Self {
-        let p = path.to_lowercase();
-        if p.contains("large-v3-turbo") || p.contains("large_v3_turbo") {
-            Self::LargeV3Turbo
-        } else if p.contains("large-v3") || p.contains("large_v3") {
-            Self::LargeV3
-        } else if p.contains("large-v2") || p.contains("large_v2") {
-            Self::LargeV2
-        } else {
-            Self::Unknown
-        }
-    }
-
-    pub fn recommended_threads() -> usize {
-        if is_apple_silicon() {
-            num_cpus::get_physical().max(1)
-        } else {
-            4
-        }
-    }
-}
-
-// ── Engine ────────────────────────────────────────────────────────────────────
+// ── Engine ─────────────────────────────────────────────────────────────────
 
 pub struct WhisperEngine {
     ctx: Arc<WhisperContext>,
-    variant: ModelVariant,
 }
 
 impl WhisperEngine {
     pub fn load(model_path: &str) -> Result<Self> {
-        let variant = ModelVariant::from_path(model_path);
-        let n_gpu_layers = get_safe_gpu_layers(&variant);
+        let hardware = if is_apple_silicon() {
+            "Apple Silicon (M1/M2/M3/M4)"
+        } else if is_intel_mac_amd() {
+            "Intel 2019 + AMD GPU"
+        } else {
+            "Unknown"
+        };
 
-        info!("🔧 WhisperEngine init → Model: {:?} | GPU layers: {}", variant, n_gpu_layers);
-        info!("🖥️  Hardware: Intel AMD → {}", is_intel_mac_amd());
+        info!("🔧 WhisperEngine init → Hardware: {}", hardware);
 
-        if is_intel_mac_amd() {
+        if is_apple_silicon() {
+            std::env::set_var("GGML_METAL_N_CB", "4");
+            std::env::set_var("GGML_METAL_MAX_BUFFER_SIZE", "32212254720");
+            std::env::set_var("GGML_METAL_USE_IO", "1");
+            std::env::set_var("GGML_METAL_F16", "1");
+        } else if is_intel_mac_amd() {
             std::env::set_var("GGML_METAL_N_CB", "2");
             std::env::set_var("GGML_METAL_MAX_BUFFER_SIZE", "2147483648");
             std::env::set_var("GGML_METAL_MPS", "0");
@@ -97,7 +61,8 @@ impl WhisperEngine {
         let ctx = WhisperContext::new(model_path)
             .map_err(|e| AutoSubError::WhisperDecode(format!("Load model failed: {}", e)))?;
 
-        Ok(Self { ctx: Arc::new(ctx), variant })
+        info!("✅ Model loaded successfully on Metal ({})", hardware);
+        Ok(Self { ctx: Arc::new(ctx) })
     }
 
     pub async fn transcribe(
@@ -106,65 +71,28 @@ impl WhisperEngine {
         language: &str,
         threads: Option<usize>,
         progress_tx: Option<mpsc::Sender<WhisperNativeProgress>>,
-        abort_flag: Option<Arc<AtomicBool>>,
+        _abort_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Vec<Segment>> {
         let ctx = self.ctx.clone();
-        let language = if language == "auto" || language.is_empty() { None } else { Some(language) };
-        let n_threads = threads.unwrap_or_else(ModelVariant::recommended_threads);
+        let lang = if language == "auto" || language.is_empty() { None } else { Some(language) };
+        let n_threads = threads.unwrap_or_else(|| {
+            if is_apple_silicon() { num_cpus::get_physical().max(1) } else { 4 }
+        });
 
-        let result = tokio::task::spawn_blocking(move || {
-            let params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 })
-                .language(language.unwrap_or(""))
+        let start = Instant::now();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<Segment>> {  // ← fix type inference
+            let params = TranscriptionParams::builder()
+                .language(lang.unwrap_or(""))
                 .n_threads(n_threads as i32)
-                .token_timestamps(true)
-                .split_on_word(true)
-                .max_len(42)
-                .thold_pt(0.6)
-                .logprob_thold(-1.0)
-                .print_special(false)
-                .print_progress(false)
-                .print_realtime(false)
-                .print_timestamps(false);
+                .enable_timestamps()
+                .build();
 
-            let mut stream = WhisperStream::new(&ctx, params)
-                .map_err(|e| AutoSubError::WhisperDecode(format!("Stream init failed: {}", e)))?;
-
-            let chunk_size = 16000;
-            let mut segments = Vec::new();
-            let total_samples = samples.len() as i64;
-            let mut processed = 0usize;
-
-            for chunk in samples.chunks(chunk_size) {
-                if let Some(flag) = &abort_flag {
-                    if flag.load(Ordering::Relaxed) {
-                        return Err(AutoSubError::WhisperDecode("Operation aborted by user".into()));
-                    }
-                }
-
-                stream.feed_audio(chunk);
-
-                if let Some(new_segs) = stream.process_step()
-                    .map_err(|e| AutoSubError::WhisperDecode(e.to_string()))?
-                {
-                    segments.extend(new_segs);
-                }
-
-                processed += chunk.len();
-                if let Some(tx) = &progress_tx {
-                    let percent = (processed as f64 / total_samples as f64 * 100.0) as f32;
-                    let _ = tx.try_send(WhisperNativeProgress {
-                        percent: percent.min(100.0),
-                        segment_count: segments.len(),
-                    });
-                }
-            }
-
-            let final_segs = stream.flush()
+            let transcription = ctx.transcribe_with_params(&samples, params)
                 .map_err(|e| AutoSubError::WhisperDecode(e.to_string()))?;
-            segments.extend(final_segs);
 
-            // Convert sang Segment (đã cast f32)
-            let result: Vec<Segment> = segments
+            let segments: Vec<Segment> = transcription
+                .segments
                 .into_iter()
                 .map(|s| Segment {
                     start: s.start_ms as f32 / 1000.0,
@@ -174,7 +102,12 @@ impl WhisperEngine {
                 })
                 .collect();
 
-            Ok(result)
+            if let Some(tx) = &progress_tx {
+                let _ = tx.try_send(WhisperNativeProgress { percent: 100.0, segment_count: segments.len() });
+            }
+
+            info!("Transcription completed in {:.2}s on {}", start.elapsed().as_secs_f32(), if is_apple_silicon() { "Apple Silicon" } else { "Intel AMD" });
+            Ok(segments)
         })
         .await
         .map_err(|e| AutoSubError::WhisperDecode(format!("Task panicked: {}", e)))??;
